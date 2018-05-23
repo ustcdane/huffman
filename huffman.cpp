@@ -223,8 +223,8 @@ static unsigned int get_symbol_frequencies(SymbolFrequencies pSF, FILE *in)
 
 	return total_count;
 }
-/* Get the frequency of each symbol from the stat arr. */
-static unsigned int get_symbol_frequencies_from_stat(SymbolFrequencies pSF, unsigned int* arrStat)
+/* Get the frequency of each symbol from the freq symbolFreq={0,0,2,...0} which has 256 items */
+static unsigned int get_symbol_frequencies_from_stat(SymbolFrequencies pSF, unsigned int* symbolFreq)
 {
 	unsigned int total_count = 0;
 
@@ -234,18 +234,15 @@ static unsigned int get_symbol_frequencies_from_stat(SymbolFrequencies pSF, unsi
 	for (int i = 0; i<MAX_SYMBOLS; ++i)
 	{
 		unsigned char uc = (unsigned char)i;
-		if (!pSF[uc] && arrStat[i] > 0)
+		if (!pSF[uc] && symbolFreq[i] > 0)
 		{
 			pSF[uc] = new_leaf_node(uc);
-			pSF[uc]->count = arrStat[i];
-			total_count += arrStat[i];
+			pSF[uc]->count = symbolFreq[i];
+			total_count += symbolFreq[i];
 		}
 	}
-
 	return total_count;
 }
-
-
 
 /*
 * build_symbol_encoder builds a SymbolEncoder by walking
@@ -686,65 +683,7 @@ int huffman_decode(FILE *in, uint8_t *decodeOut, int num)
 	free_huffman_tree(root);
 	return 0;
 }
-int
-huffman_decode_file(FILE *in, FILE *out)
-{
-	huffman_node *root = NULL, *p = NULL;
-	int c = 0;
-	unsigned int data_count = 0;
 
-	/* Read the Huffman code table. */
-	if (!read_code_table(in, &root, &data_count))
-	{
-		return 1;
-	}
-
-	if (root == NULL && data_count == 0) {
-		// This is what an empty encoded file looks like. It's valid, but nothing to do.
-		// Exit out here so we don't have to special case NULL roots and 0 data_counts.
-		return 0;
-	}
-
-	if (root->isLeaf) {
-		// This is a one symbol file. That means it's decoded only with data_count since
-		// the symbol is encoded with a 0 length bit pattern.
-		while (data_count-- > 0) {
-			fputc(root->symbol, out);
-		}
-		free_huffman_tree(root);
-		return 0;
-	}
-
-	// This is a multi-symbol, non-empty file.
-	p = root;
-	while (data_count > 0 && (c = fgetc(in)) != EOF)
-	{
-		unsigned char byte = (unsigned char)c;
-		unsigned char mask = 1;
-		while (data_count > 0 && mask)
-		{
-			p = byte & mask ? p->one : p->zero;
-			if (p == NULL)
-			{
-				// Invalid file.
-				free_huffman_tree(root);
-				return 1;
-			}
-
-			mask <<= 1;
-
-			if (p->isLeaf)
-			{
-				fputc(p->symbol, out);
-				p = root;
-				--data_count;
-			}
-		}
-	}
-
-	free_huffman_tree(root);
-	return 0;
-}
 int main()
 {
 	const char *file_in = NULL, *file_out = "encode.out";
@@ -766,7 +705,6 @@ int main()
 	in = fopen(file_out, "rb");
 	out = fopen("decompress.out", "wb");
 	unsigned char decode[8] = { 0 };
-	//huffman_decode_file(in, out);
 	huffman_decode(in, decode, 8);
 	for (int i = 0; i <8; ++i)
 	{
