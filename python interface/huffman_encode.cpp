@@ -1,0 +1,791 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <assert.h>
+#include <stdint.h>
+#include <vector>
+#include "numpy/arrayobject.h"
+
+typedef struct huffman_node_tag
+{
+	unsigned char isLeaf;
+	unsigned long count;
+	struct huffman_node_tag *parent;
+
+	union
+	{
+		struct
+		{
+			struct huffman_node_tag *zero, *one;
+		};
+		unsigned char symbol;
+	};
+} huffman_node;
+
+typedef struct huffman_code_tag
+{
+	/* The length of this code in bits. */
+	unsigned long numbits;
+
+	/* The bits that make up this code. The first
+	bit is at position 0 in bits[0]. The second
+	bit is at position 1 in bits[0]. The eighth
+	bit is at position 7 in bits[0]. The ninth
+	bit is at position 0 in bits[1]. */
+	unsigned char *bits;
+} huffman_code;
+
+static unsigned long numbytes_from_numbits(unsigned long numbits)
+{
+	return numbits / 8 + (numbits % 8 ? 1 : 0);
+}
+
+/*
+* get_bit returns the ith bit in the bits array
+* in the 0th position of the return value.
+*/
+static unsigned char get_bit(unsigned char* bits, unsigned long i)
+{
+	return (bits[i / 8] >> i % 8) & 1;
+}
+
+static void reverse_bits(unsigned char* bits, unsigned long numbits)
+{
+	unsigned long numbytes = numbytes_from_numbits(numbits);
+	unsigned char *tmp = (unsigned char*)malloc(numbytes);
+	unsigned long curbit;
+	long curbyte = 0;
+
+	memset(tmp, 0, numbytes);
+
+	for (curbit = 0; curbit < numbits; ++curbit)
+	{
+		unsigned int bitpos = curbit % 8;
+
+		if (curbit > 0 && curbit % 8 == 0)
+			++curbyte;
+
+		tmp[curbyte] |= (get_bit(bits, numbits - curbit - 1) << bitpos);
+	}
+
+	memcpy(bits, tmp, numbytes);
+	free(tmp);
+}
+
+/*
+* new_code builds a huffman_code from a leaf in
+* a Huffman tree.
+*/
+static huffman_code* new_code(const huffman_node* leaf)
+{
+	/* Build the huffman code by walking up to
+	* the root node and then reversing the bits,
+	* since the Huffman code is calculated by
+	* walking down the tree. */
+	unsigned long numbits = 0;
+	unsigned char* bits = NULL;
+	huffman_code *p;
+
+	while (leaf && leaf->parent)
+	{
+		huffman_node *parent = leaf->parent;
+		unsigned char cur_bit = (unsigned char)(numbits % 8);
+		unsigned long cur_byte = numbits / 8;
+
+		/* If we need another byte to hold the code,
+		then allocate it. */
+		if (cur_bit == 0)
+		{
+			size_t newSize = cur_byte + 1;
+			bits = (unsigned char*)realloc(bits, newSize);
+			bits[newSize - 1] = 0; /* Initialize the new byte. */
+		}
+
+		/* If a one must be added then or it in. If a zero
+		* must be added then do nothing, since the byte
+		* was initialized to zero. */
+		if (leaf == parent->one)
+			bits[cur_byte] |= 1 << cur_bit;
+
+		++numbits;
+		leaf = parent;
+	}
+
+	if (bits)
+		reverse_bits(bits, numbits);
+
+	p = (huffman_code*)malloc(sizeof(huffman_code));
+	p->numbits = numbits;
+	p->bits = bits;
+	return p;
+}
+
+#define MAX_SYMBOLS 256
+typedef huffman_node* SymbolFrequencies[MAX_SYMBOLS];
+typedef huffman_code* SymbolEncoder[MAX_SYMBOLS];
+
+static huffman_node* new_leaf_node(unsigned char symbol)
+{
+	huffman_node *p = (huffman_node*)malloc(sizeof(huffman_node));
+	p->isLeaf = 1;
+	p->symbol = symbol;
+	p->count = 0;
+	p->parent = 0;
+	return p;
+}
+
+static huffman_node* new_nonleaf_node(unsigned long count, huffman_node *zero, huffman_node *one)
+{
+	huffman_node *p = (huffman_node*)malloc(sizeof(huffman_node));
+	p->isLeaf = 0;
+	p->count = count;
+	p->zero = zero;
+	p->one = one;
+	p->parent = 0;
+
+	return p;
+}
+
+static void free_huffman_tree(huffman_node *subtree)
+{
+	if (subtree == NULL)
+		return;
+
+	if (!subtree->isLeaf)
+	{
+		free_huffman_tree(subtree->zero);
+		free_huffman_tree(subtree->one);
+	}
+
+	free(subtree);
+}
+
+static void free_code(huffman_code* p)
+{
+	free(p->bits);
+	free(p);
+}
+
+static void free_encoder(SymbolEncoder *pSE)
+{
+	unsigned long i;
+	for (i = 0; i < MAX_SYMBOLS; ++i)
+	{
+		huffman_code *p = (*pSE)[i];
+		if (p)
+			free_code(p);
+	}
+
+	free(pSE);
+}
+
+/*
+* When used by qsort, SFComp sorts the array so that
+* the symbol with the lowest frequency is first. Any
+* NULL entries will be sorted to the end of the list.
+*/
+static int SFComp(const void *p1, const void *p2)
+{
+	const huffman_node *hn1 = *(const huffman_node**)p1;
+	const huffman_node *hn2 = *(const huffman_node**)p2;
+
+	/* Sort all NULLs to the end. */
+	if (hn1 == NULL && hn2 == NULL)
+		return 0;
+	if (hn1 == NULL)
+		return 1;
+	if (hn2 == NULL)
+		return -1;
+
+	if (hn1->count > hn2->count)
+		return 1;
+	else if (hn1->count < hn2->count)
+		return -1;
+
+	return 0;
+}
+
+static unsigned int get_symbol_frequencies(SymbolFrequencies pSF, FILE *in)
+{
+	int c;
+	unsigned int total_count = 0;
+
+	/* Set all frequencies to 0. */
+	memset(pSF, 0, sizeof(SymbolFrequencies));
+	/* Count the frequency of each symbol in the input file. */
+	while ((c = fgetc(in)) != EOF)
+	{
+		unsigned char uc = c;
+		if (!pSF[uc])
+			pSF[uc] = new_leaf_node(uc);
+		++(pSF[uc]->count);
+		++total_count;
+	}
+
+	return total_count;
+}
+/* Get the frequency of each symbol from the freq symbolFreq={0,0,2,...0} which has 256 items */
+static unsigned int get_symbol_frequencies(SymbolFrequencies pSF, uint32_t* symbolFreq)
+{
+	unsigned int total_count = 0;
+
+	/* Set all frequencies to 0. */
+	memset(pSF, 0, sizeof(SymbolFrequencies));
+	/* Get the frequency of each symbol from the stat arr. Ignore freq=0*/
+	for (int i = 0; i<MAX_SYMBOLS; ++i)
+	{
+		unsigned char uc = (unsigned char)i;
+		if (!pSF[uc] && symbolFreq[i] > 0)
+		{
+			pSF[uc] = new_leaf_node(uc);
+			pSF[uc]->count = symbolFreq[i];
+			total_count += symbolFreq[i];
+		}
+	}
+	return total_count;
+}
+
+/*
+* build_symbol_encoder builds a SymbolEncoder by walking
+* down to the leaves of the Huffman tree and then,
+* for each leaf, determines its code.
+*/
+static void build_symbol_encoder(huffman_node *subtree, SymbolEncoder *pSE)
+{
+	if (subtree == NULL)
+		return;
+
+	if (subtree->isLeaf)
+		(*pSE)[subtree->symbol] = new_code(subtree);
+	else
+	{
+		build_symbol_encoder(subtree->zero, pSE);
+		build_symbol_encoder(subtree->one, pSE);
+	}
+}
+
+/*
+* calculate_huffman_codes turns pSF into an array
+* with a single entry that is the root of the
+* huffman tree. The return value is a SymbolEncoder,
+* which is an array of huffman codes index by symbol value.
+*/
+//#define ENABLE_SYMBOL_FREQUENCY_PRINT 1
+#if ENABLE_SYMBOL_FREQUENCY_PRINT
+static void print_freqs(SymbolFrequencies pSF)
+{
+	size_t i;
+	for (i = 0; i < MAX_SYMBOLS; ++i)
+	{
+		if (pSF[i])
+			printf("%d: %ld,", pSF[i]->symbol, pSF[i]->count);
+		else
+			printf("NULL,");
+	}
+	putchar('\n');
+}
+#endif
+
+static SymbolEncoder* calculate_huffman_codes(SymbolFrequencies pSF)
+{
+	unsigned int i = 0;
+	unsigned int n = 0;
+	huffman_node *m1 = NULL, *m2 = NULL;
+	SymbolEncoder *pSE = NULL;
+
+#if ENABLE_SYMBOL_FREQUENCY_PRINT
+	printf("BEFORE SORT\n");
+	print_freqs(pSF);
+#endif
+
+	/* Sort the symbol frequency array by ascending frequency. */
+	qsort(pSF, MAX_SYMBOLS, sizeof(pSF[0]), SFComp);
+
+#if ENABLE_SYMBOL_FREQUENCY_PRINT
+	printf("AFTER SORT\n");
+	print_freqs(pSF);
+#endif
+
+	/* Get the number of symbols. */
+	for (n = 0; n < MAX_SYMBOLS && pSF[n]; ++n)
+		;
+
+	/*
+	* Construct a Huffman tree. This code is based
+	* on the algorithm given in Managing Gigabytes
+	* by Ian Witten et al, 2nd edition, page 34.
+	* Note that this implementation uses a simple
+	* count instead of probability.
+	*/
+	for (i = 1; i < n; ++i)
+	{
+		/* Set m1 and m2 to the two subsets of least probability. */
+		m1 = pSF[0];
+		m2 = pSF[1];
+
+		/* Replace m1 and m2 with a set {m1, m2} whose probability
+		* is the sum of that of m1 and m2. */
+		pSF[0] = m1->parent = m2->parent =
+			new_nonleaf_node(m1->count + m2->count, m1, m2);
+		pSF[1] = NULL;
+
+		/* Put newSet into the correct count position in pSF. */
+		qsort(pSF, n, sizeof(pSF[0]), SFComp);
+	}
+
+	/* Build the SymbolEncoder array from the tree. */
+	pSE = (SymbolEncoder*)malloc(sizeof(SymbolEncoder));
+	//printf("%d\n", sizeof(SymbolEncoder));
+	memset(pSE, 0, sizeof(SymbolEncoder));
+	build_symbol_encoder(pSF[0], pSE);
+	return pSE;
+}
+
+
+/*
+* Write the huffman code table. The format is:
+* 4 byte code count in network byte order.
+* 4 byte number of bytes encoded
+*   (if you decode the data, you should get this number of bytes)
+* code1
+* ...
+* codeN, where N is the count read at the begginning of the file.
+* Each codeI has the following format:
+* 1 byte symbol, 1 byte code bit length, code bytes.
+* Each entry has numbytes_from_numbits code bytes.
+* The last byte of each code may have extra bits, if the number of
+* bits in the code is not a multiple of 8.
+*/
+static int write_code_table(FILE* out, SymbolEncoder *se, uint32_t symbol_count)
+{
+	uint32_t i, count = 0;
+
+	/* Determine the number of entries in se. */
+	for (i = 0; i < MAX_SYMBOLS; ++i)
+	{
+		if ((*se)[i])
+			++count;
+	}
+
+	/* Write the number of entries in network byte order. */
+	//i = htonl(count);
+	i = count;
+	if (fwrite(&i, sizeof(i), 1, out) != 1)
+		return 1;
+
+	/* Write the number of bytes that will be encoded. */
+	//symbol_count = htonl(symbol_count);
+	if (fwrite(&symbol_count, sizeof(symbol_count), 1, out) != 1)
+		return 1;
+
+	/* Write the entries. */
+	for (i = 0; i < MAX_SYMBOLS; ++i)
+	{
+		huffman_code *p = (*se)[i];
+		if (p)
+		{
+			unsigned int numbytes;
+			/* Write the 1 byte symbol. */
+			fputc((unsigned char)i, out);
+			/* Write the 1 byte code bit length. */
+			fputc(p->numbits, out);
+			/* Write the code bytes. */
+			numbytes = numbytes_from_numbits(p->numbits);
+			if (fwrite(p->bits, 1, numbytes, out) != numbytes)
+				return 1;
+		}
+	}
+
+	return 0;
+}
+
+static int do_encode(uint8_t *source, long num, SymbolEncoder *se, FILE* out)
+{
+	unsigned char curbyte = 0;
+	unsigned char curbit = 0;
+	int c;
+	long items = 0;
+	while (items < num)
+	{
+		unsigned char uc = (unsigned char)source[items];
+		huffman_code *code = (*se)[uc];
+		unsigned long i;
+
+		for (i = 0; i < code->numbits; ++i)
+		{
+			/* Add the current bit to curbyte. */
+			curbyte |= get_bit(code->bits, i) << curbit;
+
+			/* If this byte is filled up then write it
+			* out and reset the curbit and curbyte. */
+			if (++curbit == 8)
+			{
+				fputc(curbyte, out);
+				curbyte = 0;
+				curbit = 0;
+			}
+		}
+		++items;
+	}
+
+	/*
+	* If there is data in curbyte that has not been
+	* output yet, which means that the last encoded
+	* character did not fall on a byte boundary,
+	* then output it.
+	*/
+	if (curbit > 0)
+		fputc(curbyte, out);
+
+	return 0;
+}
+
+/*
+* huffman_encode_file huffman encodes in to out.
+* source with num items is which to encode.
+* symbol_freq length is 256
+* out is file to write
+*/
+int huffman_encode(uint8_t *source, long num, uint32_t *symbol_freq, FILE *out)
+{
+	SymbolFrequencies sf;
+	SymbolEncoder *se;
+	huffman_node *root = NULL;
+	int rc;
+	unsigned int symbol_count;
+	/* Get the frequency of each symbol in the input file. */
+	symbol_count = get_symbol_frequencies(sf, symbol_freq);
+
+	/* Build an optimal table from the symbolCount. */
+	se = calculate_huffman_codes(sf);
+	root = sf[0];
+
+	/* Scan the file again and, using the table
+	previously built, encode it into the output file. */
+	//rewind(in);
+	rc = write_code_table(out, se, symbol_count);
+	if (rc == 0)
+		rc = do_encode(source, num, se, out);
+
+	/* Free the Huffman tree. */
+	free_huffman_tree(root);
+	free_encoder(se);
+	return rc;
+}
+
+/*
+* read_code_table builds a Huffman tree from the code
+* in the in file. This function returns NULL on error.
+* The returned value should be freed with free_huffman_tree.
+*/
+static bool read_code_table(FILE* in, huffman_node** rootOut, unsigned int *dataBytesOut)
+{
+	huffman_node *root = NULL;
+	uint32_t count = 0;
+
+	/* Read the number of entries.
+	(it is stored in network byte order). */
+	if (fread(&count, sizeof(count), 1, in) != 1)
+	{
+		return false;
+	}
+
+	if (count > MAX_SYMBOLS)
+	{
+		return false;
+	}
+
+	/* Read the number of data bytes this encoding represents. */
+	unsigned int dataBytes = 0;
+	if (fread(&dataBytes, sizeof(dataBytes), 1, in) != 1)
+	{
+		return false;
+	}
+
+	if (count == 0 && dataBytes > 0)
+	{
+		// Cannot decode data bytes without any decode table entries.
+		return false;
+	}
+
+	/* Read the entries. */
+	while (count-- > 0)
+	{
+		int c = 0;
+
+		if ((c = fgetc(in)) == EOF)
+		{
+			free_huffman_tree(root);
+			return false;
+		}
+		unsigned char symbol = (unsigned char)c;
+
+		if ((c = fgetc(in)) == EOF)
+		{
+			free_huffman_tree(root);
+			return false;
+		}
+		unsigned char numbits = (unsigned char)c;
+
+		if (root == NULL)
+		{
+			if (numbits == 0)
+			{
+				// Valid code tables only have 0 bit length codes if they encode only 1 symbol.
+				if (count != 0) {
+					// Invalid code table. Abort processing.
+					return false;
+				}
+
+				*rootOut = new_leaf_node(symbol);
+				*dataBytesOut = dataBytes;
+				return true;
+			}
+
+			root = new_nonleaf_node(0, NULL, NULL);
+		}
+
+		if (numbits == 0) {
+			// Valid code tables only have 0 bit length codes if they encode only 1 symbol.
+			free_huffman_tree(root);
+			return false;
+
+		}
+
+		assert(root != NULL);
+		huffman_node *p = root;
+		unsigned char numbytes = (unsigned char)numbytes_from_numbits(numbits);
+		unsigned char *bytes = (unsigned char*)malloc(numbytes);
+		if (fread(bytes, 1, numbytes, in) != numbytes)
+		{
+			free(bytes);
+			free_huffman_tree(root);
+			return false;
+		}
+
+		/*
+		* Add the entry to the Huffman tree. The value
+		* of the current bit is used switch between
+		* zero and one child nodes in the tree. New nodes
+		* are added as needed in the tree.
+		*/
+		for (unsigned int curbit = 0; curbit < numbits; ++curbit)
+		{
+			if (p->isLeaf)
+			{
+				// Invalid input.
+				free(bytes);
+				free_huffman_tree(root);
+				return false;
+			}
+
+			if (get_bit(bytes, curbit))
+			{
+				assert(p != NULL);
+				if (p->one == NULL)
+				{
+					p->one = curbit == (unsigned char)(numbits - 1)
+						? new_leaf_node(symbol)
+						: new_nonleaf_node(0, NULL, NULL);
+					assert(p->one != NULL);
+					p->one->parent = p;
+				}
+				assert(p->one != NULL);
+				p = p->one;
+			}
+			else
+			{
+				assert(p != NULL);
+				if (p->zero == NULL)
+				{
+					p->zero = curbit == (unsigned char)(numbits - 1)
+						? new_leaf_node(symbol)
+						: new_nonleaf_node(0, NULL, NULL);
+					assert(p->zero != NULL);
+					p->zero->parent = p;
+				}
+				assert(p->zero != NULL);
+				p = p->zero;
+			}
+		}
+
+		free(bytes);
+	}
+
+	*rootOut = root;
+	*dataBytesOut = dataBytes;
+	return true;
+}
+
+/*
+* in is huffman codetabel and codes, decodeOut is output buf with num length.
+*/
+int huffman_decode(FILE *in, uint8_t *decodeOut, int num)
+{
+	huffman_node *root = NULL, *p = NULL;
+	int c = 0;
+	unsigned int data_count = 0;
+
+	/* Read the Huffman code table. */
+	if (!read_code_table(in, &root, &data_count))
+	{
+		return 1;
+	}
+	assert(data_count == num);
+	int items = 0;
+	if (root == NULL && data_count == 0) {
+		// This is what an empty encoded file looks like. It's valid, but nothing to do.
+		// Exit out here so we don't have to special case NULL roots and 0 data_counts.
+		return 0;
+	}
+
+	if (root->isLeaf) {
+		// This is a one symbol file. That means it's decoded only with data_count since
+		// the symbol is encoded with a 0 length bit pattern.
+		while (data_count-- > 0) {
+			//fputc(root->symbol, stdout);
+			decodeOut[items++] = root->symbol;
+		}
+		free_huffman_tree(root);
+		return 0;
+	}
+
+	// This is a multi-symbol, non-empty file.
+	p = root;
+	while (data_count > 0 && (c = fgetc(in)) != EOF)
+	{
+		unsigned char byte = (unsigned char)c;
+		unsigned char mask = 1;
+		while (data_count > 0 && mask)
+		{
+			p = byte & mask ? p->one : p->zero;
+			if (p == NULL)
+			{
+				// Invalid file.
+				free_huffman_tree(root);
+				return 1;
+			}
+
+			mask <<= 1;
+
+			if (p->isLeaf)
+			{
+				//fputc(p->symbol, out);
+				decodeOut[items++] = p->symbol;
+				p = root;
+				--data_count;
+			}
+		}
+	}
+	free_huffman_tree(root);
+	return 0;
+}
+
+void huffman_encode_dump(PyObject *pLabel,int labelNum, char *fileName)
+{
+	uint8_t *uLabel = (uint8_t*)PyArray_GETPTR1(pLabel, 0);
+	FILE *out =  fopen(fileName, "wb");
+	if(!out) {
+		fprintf(stderr, "Error. Can't open output file '%s'!!\n", fileName);
+		return ;
+	}
+	//printf("labelNum:%d\n", labelNum);
+	unsigned int label_cnt[MAX_SYMBOLS] = {0};
+	for(int i=0; i<labelNum; ++i)
+		label_cnt[uLabel[i]]+=1;
+	
+	huffman_encode(uLabel, labelNum, label_cnt, out);
+	fclose(out);
+}
+
+void huffman_encode_dump(PyObject *pLabel, PyObject *pCodeBook, int labelNum, int nCodeBookLen, char *fileName)
+{
+	uint8_t *uLabel = (uint8_t*)PyArray_GETPTR1(pLabel, 0);
+	float *fCodeBook = (float *) PyArray_GETPTR1(pCodeBook, 0);
+	FILE *out =  fopen(fileName, "wb");
+	if(!out) {
+		fprintf(stderr, "Error. Can't open output file '%s'!!\n", fileName);
+		return ;
+	}
+
+	for(int i=0; i < nCodeBookLen; ++i)
+		fwrite((fCodeBook+i), sizeof(float), 1, out);
+	unsigned int label_cnt[MAX_SYMBOLS] = {0};
+	for(int i=0; i<labelNum; ++i)
+		label_cnt[uLabel[i]]+=1;
+	
+	huffman_encode(uLabel, labelNum, label_cnt, out);
+	fclose(out);
+}
+
+// If has CodeBook , read codebook first then decode huffman 
+void huffman_decode(char *fileName, PyObject *pOut,int outLen, bool hasCodeBook=true)
+{
+	float *cWeights = NULL;
+	uint8_t *label = NULL;
+	if(hasCodeBook)//decode to float 
+		cWeights = (float *) PyArray_GETPTR1(pOut, 0);
+	else
+		label = (uint8_t *) PyArray_GETPTR1(pOut, 0);
+
+	uint8_t *labelTemp = new uint8_t[outLen];
+
+	FILE *in =  fopen(fileName, "rb");
+	if(!in) {
+		fprintf(stderr, "Error. Can't open output file '%s'!!\n", fileName);
+		return ;
+	}
+	const int codebook_size = hasCodeBook ? 256:0; 
+	std::vector<float> cCodeBook(codebook_size);
+	if(hasCodeBook) {
+		float fl =0;
+		for (int i =0; i < codebook_size; ++i) {
+			fread(&fl, 4, 1, in);
+			cCodeBook[i] = fl;
+		}
+	}
+	if(huffman_decode(in, labelTemp, outLen)) {
+		fprintf(stderr, "Error.'%s' huffman decode error!!\n", fileName);
+		return ;
+	}
+	
+	if(hasCodeBook)
+		for(int i=0; i < outLen; ++i)
+			cWeights[i] = cCodeBook[labelTemp[i]];
+	else
+		memcpy(label, labelTemp, outLen*sizeof(uint8_t));
+	
+	fclose(in);
+	delete []labelTemp;
+}
+
+int main_()
+{
+	const char *file_in = NULL, *file_out = "encode.out";
+	FILE *in = stdin;
+	FILE *out = stdout;
+	out = fopen(file_out, "wb");
+	if (!out)//|| !in)
+	{
+		fprintf(stderr, "Can't open output file '%s': %s\n", file_out, strerror(errno));
+		return 1;
+	}
+	uint32_t arr[256] = { 0 };
+	arr[65] = 4;//A
+	arr[66] = 2;
+	arr[67] = 2;
+	uint8_t src[8] = { 'A','A','A','A','B','B','C','C' };
+	huffman_encode(src, 8, arr, out);
+	fclose(out);
+	in = fopen(file_out, "rb");
+	unsigned char decode[8] = { 0 };
+	huffman_decode(in, decode, 8);
+	for (int i = 0; i <8; ++i)
+	{
+		fputc(decode[i], stdout);
+	}
+	fclose(in);
+	getchar();
+	return 0;
+}
